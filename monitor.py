@@ -2,185 +2,219 @@
 import json
 import os
 import re
-import sys
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://p-bandai.com"
-SHOPS_URL = f"{BASE_URL}/us/shops"
-HOME_URL = f"{BASE_URL}/us/?lang=en"
+LISTING_URLS = [
+    "https://p-bandai.com/us/shops",
+    "https://p-bandai.com/us/?lang=en",
+]
 STATE_FILE = Path("seen_products.json")
-
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/130.0.0.0 Safari/537.36"
-    )
+    "User-Agent": "Mozilla/5.0 (compatible; TCGAvailabilityMonitor/1.0)"
 }
+PRODUCT_PATH = re.compile(r"^/us/(?:item|hotdeals)/", re.I)
 
-# Keywords used to identify trading-card products across TCG brands.
-TCG_TERMS = [
-    "card game", "trading card", "tcg",
-    "one piece card", "digimon", "dragon ball super",
-    "gundam card", "union arena", "battle spirits",
-    "pokemon card", "pokemon tcg", "card pack",
-    "card set", "card collection", "card sleeves",
-    "booster pack", "starter deck", "deck build box",
-    "premium card", "limited card pack",
+LOTTERY_TERMS = [
+    "chance to buy",
+    "lottery",
+    "drawing entry",
+    "enter for a chance",
+]
+UNAVAILABLE_TERMS = [
+    "sold out",
+    "out of stock",
+    "currently unavailable",
+    "temporarily unavailable",
+]
+AVAILABLE_BUTTON_TERMS = [
+    "add to cart",
+    "add to bag",
+    "buy now",
+    "pre-order",
+    "place order",
+    "add to basket",
 ]
 
-# Only accept product-detail URLs, not category/search links.
-PRODUCT_PATHS = ("/us/item/", "/us/hotdeals/")
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {}
+
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list):
+            # Support the older version that stored URLs only.
+            return {url: {"status": "unknown"} for url in data}
+    except (json.JSONDecodeError, OSError):
+        print("Could not read saved product history.")
+
+    return {}
 
 
-def get_page(url):
+def get_soup(url):
     response = requests.get(
         url, headers=HEADERS, timeout=25
     )
     response.raise_for_status()
-    return response.text
+    return BeautifulSoup(response.text, "html.parser")
 
 
-def find_card_shop_url():
-    """Discover the official Bandai Card Shop link."""
-    soup = BeautifulSoup(get_page(SHOPS_URL), "html.parser")
-
-    for anchor in soup.find_all("a", href=True):
-        text = " ".join(anchor.stripped_strings).lower()
-        if "bandai card shop" in text:
-            return urljoin(BASE_URL, anchor["href"])
-
-    # Safe fallback: the official shop directory.
-    # The monitor will also inspect product links on the homepage.
-    print("Card Shop link not found; using homepage fallback.")
-    return HOME_URL
-
-
-def is_tcg_product(title, url):
-    text = f"{title} {url}".lower()
-    return any(term in text for term in TCG_TERMS)
-
-
-def get_products(page_url):
-    """Extract matching product-detail links from a page."""
-    soup = BeautifulSoup(get_page(page_url), "html.parser")
+def discover_products():
     products = {}
 
-    for anchor in soup.find_all("a", href=True):
-        href = urljoin(page_url, anchor["href"])
-        parsed = urlparse(href)
+    for listing_url in LISTING_URLS:
+        try:
+            soup = get_soup(listing_url)
 
-        if parsed.netloc not in ("p-bandai.com", "www.p-bandai.com"):
-            continue
+            for link in soup.find_all("a", href=True):
+                href = link["href"].strip()
+                url = urljoin(BASE_URL, href).split("#")[0]
 
-        if not any(path in parsed.path for path in PRODUCT_PATHS):
-            continue
+                if not PRODUCT_PATH.match(
+                    __import__("urllib.parse", fromlist=["urlparse"])
+                    .urlparse(url).path
+                ):
+                    continue
 
-        title = " ".join(anchor.stripped_strings)
-        title = re.sub(r"\s+", " ", title).strip()
+                title = link.get_text(" ", strip=True)
+                if url not in products:
+                    products[url] = title or url
 
-        # Some product cards put the title in a nested image.
-        if not title:
-            image = anchor.find("img", alt=True)
-            if image:
-                title = image["alt"].strip()
-
-        if not title or len(title) < 4:
-            continue
-
-        if not is_tcg_product(title, href):
-            continue
-
-        # Ignore tracking/query parameters for stable product IDs.
-        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        products[clean_url] = {
-            "title": title[:250],
-            "url": clean_url,
-        }
+        except requests.RequestException as error:
+            print(f"Could not scan {listing_url}: {error}")
 
     return products
 
 
-def send_alert(product):
+def check_availability(url):
+    try:
+        soup = get_soup(url)
+    except requests.RequestException as error:
+        print(f"Could not check product {url}: {error}")
+        return "unknown", url
+
+    title_tag = soup.find("h1")
+    title = title_tag.get_text(" ", strip=True) if title_tag else ""
+
+    page_text = soup.get_text(" ", strip=True).lower()
+
+    # Do not mistake a lottery entry page for a purchasable product.
+    if any(term in page_text for term in LOTTERY_TERMS):
+        return "lottery", title or url
+
+    if any(term in page_text for term in UNAVAILABLE_TERMS):
+        return "unavailable", title or url
+
+    # Check actual buttons and form controls, not just product descriptions.
+    controls = []
+    for element in soup.find_all(
+        ["button", "input", "a"], limit=1000
+    ):
+        label = " ".join([
+            element.get_text(" ", strip=True),
+            element.get("value", ""),
+            element.get("aria-label", ""),
+        ]).lower()
+        controls.append(label)
+
+    for label in controls:
+        if any(term in label for term in AVAILABLE_BUTTON_TERMS):
+            return "available", title or url
+
+    return "unknown", title or url
+
+
+def send_alert(title, url):
+    if not WEBHOOK_URL:
+        print("DISCORD_WEBHOOK_URL secret is missing.")
+        return False
+
     payload = {
         "username": "P-Bandai TCG Alerts",
+        "content": "@everyone 🆕 **TCG PRODUCT NOW AVAILABLE!**",
         "embeds": [{
-            "title": product["title"][:256],
-            "url": product["url"],
-            "description": "🆕 New TCG product listing detected on Premium Bandai USA.",
+            "title": title[:256],
+            "url": url,
+            "description": (
+                "A Premium Bandai USA product appears to be "
+                "available to order. Check out immediately."
+            ),
             "color": 16753920,
-            "footer": {"text": "Premium Bandai USA • New listing"},
+            "footer": {"text": "Premium Bandai USA"},
         }],
-        "allowed_mentions": {"parse": []},
+        "allowed_mentions": {"parse": ["everyone"]},
     }
 
-    response = requests.post(
-        WEBHOOK_URL, json=payload, timeout=20
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            WEBHOOK_URL, json=payload, timeout=20
+        )
+        response.raise_for_status()
+        print(f"Discord alert sent: {title}")
+        return True
+    except requests.RequestException as error:
+        print(f"Discord alert failed: {error}")
+        return False
 
 
 def main():
-    if not WEBHOOK_URL:
-        sys.exit("Missing DISCORD_WEBHOOK_URL secret.")
+    previous = load_state()
+    current = discover_products()
 
-    # Discover the official card shop and inspect both it and
-    # the homepage, since some new items may be surfaced there.
-    shop_url = find_card_shop_url()
-    pages = list(dict.fromkeys([shop_url, HOME_URL]))
-    products = {}
+    if not current:
+        print(
+            "No product links found. The site may load products "
+            "with JavaScript; keeping the previous history."
+        )
+        return
 
-    for page_url in pages:
-        try:
-            found = get_products(page_url)
-            products.update(found)
-            print(f"Found {len(found)} matching products on {page_url}")
-        except Exception as error:
-            print(f"Could not scan {page_url}: {error}")
+    print(f"Found {len(current)} product links.")
 
-    if not products:
-        sys.exit(
-            "No matching products found. The page may be dynamic, "
-            "blocked, or its URL structure may have changed. "
-            "Check the workflow logs before relying on alerts."
+    updated = dict(previous)
+    alerts_sent = 0
+
+    for url, listing_title in current.items():
+        status, page_title = check_availability(url)
+        old_entry = previous.get(url, {})
+        old_status = (
+            old_entry.get("status", "unknown")
+            if isinstance(old_entry, dict)
+            else "unknown"
         )
 
-    if STATE_FILE.exists():
-        seen = set(json.loads(STATE_FILE.read_text(encoding="utf-8")))
-        first_run = False
-    else:
-        seen = set()
-        first_run = True
+        title = page_title if page_title != url else listing_title
 
-    current_urls = set(products)
-    new_urls = current_urls - seen
+        print(f"{status.upper()}: {title} ({url})")
 
-    if first_run:
-        # Establish a baseline without flooding Discord with old items.
-        print(f"First run: saving baseline of {len(current_urls)} products.")
-    else:
-        for url in sorted(new_urls):
-            try:
-                send_alert(products[url])
-                print(f"Alert sent: {products[url]['title']}")
-            except Exception as error:
-                # Do not mark a product seen if the alert failed.
-                print(f"Failed to alert for {url}: {error}")
-                sys.exit(1)
+        if status == "unknown":
+            # Don't overwrite a known status when the page is unclear.
+            if url not in updated:
+                updated[url] = {"status": "unknown", "title": title}
+            continue
 
-    # Keep previous IDs as well as current IDs so an item disappearing
-    # and later returning won't trigger a duplicate "new listing" alert.
-    seen.update(current_urls)
+        if status == "available" and (
+    old_status in ("unavailable", "lottery") or url not in previous
+):
+            if send_alert(title, url):
+                alerts_sent += 1
+
+        updated[url] = {"status": status, "title": title}
+
     STATE_FILE.write_text(
-        json.dumps(sorted(seen), indent=2),
+        json.dumps(updated, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+
+    print(f"Finished. Alerts sent: {alerts_sent}")
 
 
 if __name__ == "__main__":
